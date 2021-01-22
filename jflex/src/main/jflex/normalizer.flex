@@ -5,6 +5,7 @@
 %class SqlSanitizer
 %apiprivate
 %int
+%buffer 2048
 
 %unicode
 %ignorecase

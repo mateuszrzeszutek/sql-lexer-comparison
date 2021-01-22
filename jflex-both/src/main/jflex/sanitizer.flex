@@ -2,7 +2,7 @@
 
 %public
 %final
-%class SqlInfoExtractor
+%class SqlSanitizer
 %apiprivate
 %int
 %buffer 2048
@@ -10,14 +10,32 @@
 %unicode
 %ignorecase
 
-COMMA       = ","
-OPEN_PAREN  = "("
-CLOSE_PAREN = ")"
-COMMENT     = "/*" ([^*] | "*"+ [^/*])* "*/"
-IDENTIFIER  = ([:letter:] | "_") ([:letter:] | [0-9] | [_.])*
-WHITESPACE  = [ \t\r\n]+
+COMMA             = ","
+OPEN_PAREN        = "("
+CLOSE_PAREN       = ")"
+COMMENT           = "/*" ([^*] | "*"+ [^/*])* "*/"
+IDENTIFIER        = ([:letter:] | "_") ([:letter:] | [0-9] | [_.])*
+BASIC_NUM         = [.+-]* [0-9] ([0-9] | [e.+-])*
+HEX_NUM           = "0x" ([a-f] | [0-9])+
+QUOTED_STR        = "'" ("''" | [^'])* "'"
+DOUBLE_QUOTED_STR = "\"" ("\"\"" | [^\"])* "\""
+DOLLAR_QUOTED_STR = "$$" [^$]* "$$"
+WHITESPACE        = [ \t\r\n]+
 
 %{
+  // max length of the sanitized statement - SQLs longer than this will be trimmed
+  private static final int LIMIT = 32 * 1024;
+
+  private final StringBuilder builder = new StringBuilder();
+
+  private void appendCurrentFragment() {
+    builder.append(zzBuffer, zzStartRead, zzMarkedPos - zzStartRead);
+  }
+
+  private boolean isOverLimit() {
+    return builder.length() > LIMIT;
+  }
+
   // you can reference a table in the FROM clause in one of the following ways:
   //   table
   //   table t
@@ -27,6 +45,7 @@ WHITESPACE  = [ \t\r\n]+
 
   private int parenLevel = 0;
   private Operation operation = NoOp.INSTANCE;
+  private boolean extractionDone = false;
 
   private void setOperation(Operation operation) {
     if (this.operation == NoOp.INSTANCE) {
@@ -199,68 +218,124 @@ WHITESPACE  = [ \t\r\n]+
     }
   }
 
-  private SqlStatementInfo getResult(String fullStatement) {
+  private SqlStatementInfo getResult() {
+    if (builder.length() > LIMIT) {
+      builder.delete(LIMIT, builder.length());
+    }
+    String fullStatement = builder.toString();
     return operation.getResult(fullStatement);
   }
 
-  public static SqlStatementInfo extract(String statement) {
-    SqlInfoExtractor extractor = new SqlInfoExtractor(new java.io.StringReader(statement));
+  public static SqlStatementInfo sanitize(String statement) {
+    SqlSanitizer sanitizer = new SqlSanitizer(new java.io.StringReader(statement));
     try {
-      while (!extractor.yyatEOF()) {
-        int token = extractor.yylex();
+      while (!sanitizer.yyatEOF()) {
+        int token = sanitizer.yylex();
         if (token == YYEOF) {
           break;
         }
       }
-      return extractor.getResult(statement);
+      return sanitizer.getResult();
     } catch (java.io.IOException e) {
-      return new SqlStatementInfo(statement, null, null);
+      return new SqlStatementInfo(null, null, null);
     }
   }
+
 %}
 
 %%
 
 <YYINITIAL> {
-  "SELECT" { setOperation(new Select()); }
-  "INSERT" { setOperation(new Insert()); }
-  "DELETE" { setOperation(new Delete()); }
-  "UPDATE" { setOperation(new Update()); }
-  "MERGE"  { setOperation(new Merge()); }
+
+  "SELECT" {
+          appendCurrentFragment();
+          setOperation(new Select());
+          if (isOverLimit()) return YYEOF;
+      }
+  "INSERT" {
+          appendCurrentFragment();
+          setOperation(new Insert());
+          if (isOverLimit()) return YYEOF;
+      }
+  "DELETE" {
+          appendCurrentFragment();
+          setOperation(new Delete());
+          if (isOverLimit()) return YYEOF;
+      }
+  "UPDATE" {
+          appendCurrentFragment();
+          setOperation(new Update());
+          if (isOverLimit()) return YYEOF;
+      }
+  "MERGE" {
+          appendCurrentFragment();
+          setOperation(new Merge());
+          if (isOverLimit()) return YYEOF;
+      }
 
   "FROM" {
-          boolean done = operation.handleFrom();
-          if (done) {
-            return YYEOF;
+          appendCurrentFragment();
+          if (!extractionDone) {
+            extractionDone = operation.handleFrom();
           }
+          if (isOverLimit()) return YYEOF;
       }
   "INTO" {
-          boolean done = operation.handleInto();
-          if (done) {
-            return YYEOF;
+          appendCurrentFragment();
+          if (!extractionDone) {
+            extractionDone = operation.handleInto();
           }
+          if (isOverLimit()) return YYEOF;
       }
   "JOIN" {
-          boolean done = operation.handleJoin();
-          if (done) {
-            return YYEOF;
+          appendCurrentFragment();
+          if (!extractionDone) {
+            extractionDone = operation.handleJoin();
           }
+          if (isOverLimit()) return YYEOF;
       }
   {COMMA} {
-          boolean done = operation.handleComma();
-          if (done) {
-            return YYEOF;
+          appendCurrentFragment();
+          if (!extractionDone) {
+            extractionDone = operation.handleComma();
           }
+          if (isOverLimit()) return YYEOF;
       }
   {IDENTIFIER} {
-          boolean done = operation.handleIdentifier();
-          if (done) {
-            return YYEOF;
+          appendCurrentFragment();
+          if (!extractionDone) {
+            extractionDone = operation.handleIdentifier();
           }
+          if (isOverLimit()) return YYEOF;
       }
 
-  {OPEN_PAREN}  { parenLevel += 1; }
-  {CLOSE_PAREN} { parenLevel -= 1; }
+  {OPEN_PAREN}  {
+          appendCurrentFragment();
+          parenLevel += 1;
+          if (isOverLimit()) return YYEOF;
+      }
+  {CLOSE_PAREN} {
+          appendCurrentFragment();
+          parenLevel -= 1;
+          if (isOverLimit()) return YYEOF;
+      }
 
-  {COMMENT} | {WHITESPACE} | [^] {}
+  // here is where the actual sanitization happens
+  {BASIC_NUM} | {HEX_NUM} | {QUOTED_STR} | {DOUBLE_QUOTED_STR} | {DOLLAR_QUOTED_STR} {
+          builder.append('?');
+          if (isOverLimit()) return YYEOF;
+      }
+
+  {COMMENT} {
+          appendCurrentFragment();
+          if (isOverLimit()) return YYEOF;
+      }
+  {WHITESPACE} {
+          builder.append(' ');
+          if (isOverLimit()) return YYEOF;
+      }
+  [^] {
+          appendCurrentFragment();
+          if (isOverLimit()) return YYEOF;
+      }
 }
