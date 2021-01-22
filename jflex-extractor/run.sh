@@ -1,16 +1,15 @@
 #!/bin/bash
 
+set -e
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd $SCRIPT_DIR
 
-NAME=jflex-extractor
+NAME=$(basename $(pwd))
 JAR_NAME=target/${NAME}.jar
 
-if [[ ! -f "$JAR_NAME" ]]
-then
-  mvn clean install
-fi
-rm out gc.log *.jfr
+mvn clean install > /dev/null
+rm out gc.log *.jfr > /dev/null
 
 java -Xms64m -Xmx64m\
   -Xlog:gc:gc.log\
