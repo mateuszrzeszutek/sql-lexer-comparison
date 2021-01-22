@@ -69,7 +69,7 @@ WHITESPACE        = [ \t\r\n]+
           builder.append(' ');
           if (isOverLimit()) return YYEOF;
       }
-  . {
+  .+ {
           appendCurrentFragment();
           if (isOverLimit()) return YYEOF;
       }
